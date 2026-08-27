@@ -1,0 +1,13 @@
+{
+  "name": "chamadaapp-server",
+  "version": "1.0.0",
+  "scripts": { "start": "node signaling-server.js" },
+  "engines": { "node": ">=18.0.0" },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.6.1",
+    "@seald-io/nedb": "^4.0.2",
+    "uuid": "^9.0.0",
+    "bcryptjs": "^2.4.3"
+  }
+}
