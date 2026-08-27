@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 
-const { userDb, groupDb, messageDb } = require('./database');
+const { userDb, groupDb, messageDb, friendDb, inviteDb } = require('./database');
 
 // BugReporter opcional — funciona local, ignora erros na nuvem
 let bugReporter = { reportInfo: () => {}, reportBug: () => {}, reportWarning: () => {}, getSummary: () => {} };
@@ -345,6 +345,215 @@ io.on('connection', (socket) => {
 
   socket.on('screen-share-stop', ({ channelId }) => {
     socket.to(`voice-${channelId}`).emit('peer-screen-share', { socketId: socket.id, active: false });
+  });
+
+  // ── Amizades ──────────────────────────────────────────────────────────────
+
+  // Envia pedido de amizade por username
+  socket.on('friend-request', async ({ fromId, toUsername }) => {
+    try {
+      const to = await userDb.findUser({ username: toUsername });
+      if (!to) return socket.emit('friend-error', { message: 'Usuário não encontrado' });
+      if (to.userId === fromId) return socket.emit('friend-error', { message: 'Você não pode se adicionar' });
+
+      await friendDb.sendRequest(fromId, to.userId);
+      const from = await userDb.findUser({ userId: fromId });
+
+      socket.emit('friend-request-sent', { to: { userId: to.userId, username: to.username, avatar: to.avatar } });
+
+      // Notifica destinatário se online
+      const toOnline = onlineUsers.get(to.userId);
+      if (toOnline) {
+        io.to(toOnline.socketId).emit('friend-request-received', {
+          from: { userId: from.userId, username: from.username, avatar: from.avatar }
+        });
+      }
+      console.log(`👥 ${from.username} enviou pedido para ${to.username}`);
+    } catch (err) {
+      const msg = err.message === 'Já existe pedido ou amizade'
+        ? 'Pedido já enviado ou já são amigos'
+        : 'Erro ao enviar pedido';
+      socket.emit('friend-error', { message: msg });
+    }
+  });
+
+  // Aceita pedido
+  socket.on('friend-accept', async ({ myId, fromId }) => {
+    try {
+      await friendDb.accept(fromId, myId);
+      const me   = await userDb.findUser({ userId: myId });
+      const from = await userDb.findUser({ userId: fromId });
+
+      socket.emit('friend-accepted', { friend: { userId: from.userId, username: from.username, avatar: from.avatar } });
+
+      const fromOnline = onlineUsers.get(fromId);
+      if (fromOnline) {
+        io.to(fromOnline.socketId).emit('friend-accepted', {
+          friend: { userId: me.userId, username: me.username, avatar: me.avatar }
+        });
+      }
+      console.log(`✅ ${me.username} aceitou amizade de ${from.username}`);
+    } catch (err) {
+      bugReporter.reportBug('FRIEND_ACCEPT_ERROR', err, { myId, fromId });
+    }
+  });
+
+  // Recusa ou remove amigo
+  socket.on('friend-remove', async ({ userId1, userId2 }) => {
+    try {
+      await friendDb.remove(userId1, userId2);
+      socket.emit('friend-removed', { userId: userId2 });
+      const other = onlineUsers.get(userId2);
+      if (other) io.to(other.socketId).emit('friend-removed', { userId: userId1 });
+    } catch (err) {
+      bugReporter.reportBug('FRIEND_REMOVE_ERROR', err, { userId1, userId2 });
+    }
+  });
+
+  // Carrega lista de amigos + pedidos
+  socket.on('get-friends', async ({ userId }) => {
+    try {
+      const [friendships, pending, sent] = await Promise.all([
+        friendDb.getFriends(userId),
+        friendDb.getPending(userId),
+        friendDb.getSent(userId)
+      ]);
+
+      // Enriquece com dados do usuário
+      const enrich = async (uid) => {
+        const u = await userDb.findUser({ userId: uid }).catch(() => null);
+        if (!u) return null;
+        const online = onlineUsers.get(uid);
+        return { ...u, status: online ? online.status : 'offline' };
+      };
+
+      const friends = (await Promise.all(
+        friendships.map(f => enrich(f.from === userId ? f.to : f.from))
+      )).filter(Boolean);
+
+      const pendingIn = (await Promise.all(
+        pending.map(f => enrich(f.from))
+      )).filter(Boolean);
+
+      const pendingOut = (await Promise.all(
+        sent.map(f => enrich(f.to))
+      )).filter(Boolean);
+
+      socket.emit('friends-loaded', { friends, pendingIn, pendingOut });
+    } catch (err) {
+      bugReporter.reportBug('GET_FRIENDS_ERROR', err, { userId });
+    }
+  });
+
+  // ── Chamada Privada (DM Call) ──────────────────────────────────────────────
+
+  // Iniciar chamada para um usuário
+  socket.on('dm-call-offer', ({ fromId, toId, fromUsername, fromAvatar }) => {
+    const toOnline = onlineUsers.get(toId);
+    if (!toOnline) return socket.emit('dm-call-error', { message: 'Usuário offline' });
+
+    // Cria room temporária para a chamada
+    const callRoom = `dmcall-${[fromId, toId].sort().join('-')}`;
+    socket.join(callRoom);
+
+    io.to(toOnline.socketId).emit('dm-call-incoming', {
+      fromId, fromUsername, fromAvatar, callRoom
+    });
+    console.log(`📞 ${fromUsername} ligando para ${toId}`);
+  });
+
+  // Aceitar chamada
+  socket.on('dm-call-accept', ({ callRoom, userId, username }) => {
+    socket.join(callRoom);
+    socket.to(callRoom).emit('dm-call-accepted', { userId, username });
+    console.log(`📞 ${username} aceitou chamada`);
+  });
+
+  // Recusar chamada
+  socket.on('dm-call-reject', ({ callRoom, username }) => {
+    socket.to(callRoom).emit('dm-call-rejected', { username });
+    socket.leave(callRoom);
+    console.log(`📵 ${username} recusou chamada`);
+  });
+
+  // Encerrar chamada
+  socket.on('dm-call-end', ({ callRoom, username }) => {
+    socket.to(callRoom).emit('dm-call-ended', { username });
+    socket.leave(callRoom);
+    console.log(`📵 ${username} encerrou chamada`);
+  });
+
+  // Sinalização WebRTC para chamada privada (reutiliza evento 'signal')
+  // já existe — o callRoom serve como namespace
+
+  // ── Convites de Servidor ──────────────────────────────────────────────────
+
+  // Gera código de convite para um grupo
+  socket.on('create-invite', async ({ groupId, userId }) => {
+    try {
+      const group = await groupDb.findGroup(groupId);
+      if (!group) return socket.emit('error-msg', { message: 'Grupo não encontrado' });
+      if (!group.members.includes(userId)) return socket.emit('error-msg', { message: 'Você não é membro deste grupo' });
+
+      const invite = await inviteDb.create(groupId, userId);
+      socket.emit('invite-created', { code: invite.code, groupName: group.name });
+      console.log(`🎟️ Convite criado: ${invite.code} para ${group.name}`);
+    } catch (err) {
+      bugReporter.reportBug('CREATE_INVITE_ERROR', err, { groupId });
+      socket.emit('error-msg', { message: 'Erro ao criar convite' });
+    }
+  });
+
+  // Usa código de convite para entrar no servidor
+  socket.on('use-invite', async ({ code, userId }) => {
+    try {
+      const invite = await inviteDb.findByCode(code);
+      if (!invite) return socket.emit('invite-error', { message: 'Código inválido' });
+
+      const group = await groupDb.findGroup(invite.groupId);
+      if (!group) return socket.emit('invite-error', { message: 'Servidor não encontrado' });
+
+      if (group.members.includes(userId)) {
+        return socket.emit('invite-error', { message: 'Você já é membro deste servidor' });
+      }
+
+      await groupDb.addMember(invite.groupId, userId);
+      await inviteDb.use(code);
+
+      const user = await userDb.findUser({ userId });
+      socket.join(`group-${group.groupId}`);
+      socket.emit('group-joined', { group });
+      socket.to(`group-${group.groupId}`).emit('member-joined', {
+        groupId: group.groupId,
+        user: { userId: user.userId, username: user.username, avatar: user.avatar }
+      });
+      console.log(`🎟️ ${user.username} entrou em ${group.name} via convite`);
+    } catch (err) {
+      bugReporter.reportBug('USE_INVITE_ERROR', err, { code });
+      socket.emit('invite-error', { message: 'Erro ao usar convite' });
+    }
+  });
+
+  // Também notifica amigo via DM quando convidado para servidor
+  socket.on('invite-friend-to-group', async ({ fromId, toId, groupId }) => {
+    try {
+      const group = await groupDb.findGroup(groupId);
+      const from  = await userDb.findUser({ userId: fromId });
+      if (!group || !from) return;
+
+      const invite = await inviteDb.create(groupId, fromId);
+      const toOnline = onlineUsers.get(toId);
+      if (toOnline) {
+        io.to(toOnline.socketId).emit('group-invite-received', {
+          fromUsername: from.username,
+          fromAvatar:   from.avatar,
+          groupName:    group.name,
+          code:         invite.code
+        });
+      }
+    } catch (err) {
+      bugReporter.reportBug('INVITE_FRIEND_ERROR', err, { fromId, toId, groupId });
+    }
   });
 
   // ── Desconexão ────────────────────────────────────────────────────────────

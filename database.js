@@ -19,7 +19,9 @@ const db = {
   users:          new Datastore({ filename: path.join(DATA_DIR, 'users.db'),          autoload: true }),
   groups:         new Datastore({ filename: path.join(DATA_DIR, 'groups.db'),         autoload: true }),
   messages:       new Datastore({ filename: path.join(DATA_DIR, 'messages.db'),       autoload: true }),
-  directMessages: new Datastore({ filename: path.join(DATA_DIR, 'direct_messages.db'), autoload: true })
+  directMessages: new Datastore({ filename: path.join(DATA_DIR, 'direct_messages.db'), autoload: true }),
+  friendships:    new Datastore({ filename: path.join(DATA_DIR, 'friendships.db'),    autoload: true }),
+  invites:        new Datastore({ filename: path.join(DATA_DIR, 'invites.db'),        autoload: true })
 };
 
 // Criar índices
@@ -300,5 +302,89 @@ module.exports = {
   db,
   userDb,
   groupDb,
-  messageDb
+  messageDb,
+
+  // ── Amizades ────────────────────────────────────────────────
+  friendDb: {
+    // Envia pedido de amizade
+    sendRequest: (fromId, toId) => new Promise((resolve, reject) => {
+      db.friendships.findOne({
+        $or: [{ from: fromId, to: toId }, { from: toId, to: fromId }]
+      }, (err, existing) => {
+        if (err) return reject(err);
+        if (existing) return reject(new Error('Já existe pedido ou amizade'));
+        db.friendships.insert(
+          { friendshipId: uuidv4(), from: fromId, to: toId, status: 'pending', createdAt: Date.now() },
+          (err2, doc) => err2 ? reject(err2) : resolve(doc)
+        );
+      });
+    }),
+
+    // Aceita pedido
+    accept: (fromId, toId) => new Promise((resolve, reject) => {
+      db.friendships.update(
+        { from: fromId, to: toId, status: 'pending' },
+        { $set: { status: 'accepted', acceptedAt: Date.now() } },
+        {},
+        (err, n) => err ? reject(err) : resolve(n > 0)
+      );
+    }),
+
+    // Recusa / remove
+    remove: (userId1, userId2) => new Promise((resolve, reject) => {
+      db.friendships.remove(
+        { $or: [{ from: userId1, to: userId2 }, { from: userId2, to: userId1 }] },
+        { multi: true },
+        (err, n) => err ? reject(err) : resolve(n)
+      );
+    }),
+
+    // Lista amigos aceitos
+    getFriends: (userId) => new Promise((resolve, reject) => {
+      db.friendships.find(
+        { $or: [{ from: userId }, { to: userId }], status: 'accepted' },
+        (err, docs) => err ? reject(err) : resolve(docs)
+      );
+    }),
+
+    // Pedidos pendentes recebidos
+    getPending: (userId) => new Promise((resolve, reject) => {
+      db.friendships.find({ to: userId, status: 'pending' },
+        (err, docs) => err ? reject(err) : resolve(docs)
+      );
+    }),
+
+    // Pedidos enviados
+    getSent: (userId) => new Promise((resolve, reject) => {
+      db.friendships.find({ from: userId, status: 'pending' },
+        (err, docs) => err ? reject(err) : resolve(docs)
+      );
+    })
+  },
+
+  // ── Convites de servidor ─────────────────────────────────────
+  inviteDb: {
+    // Cria convite (código único de 8 chars)
+    create: (groupId, createdBy) => new Promise((resolve, reject) => {
+      const code = Math.random().toString(36).substring(2, 10).toUpperCase();
+      db.invites.insert(
+        { code, groupId, createdBy, uses: 0, createdAt: Date.now() },
+        (err, doc) => err ? reject(err) : resolve(doc)
+      );
+    }),
+
+    // Busca por código
+    findByCode: (code) => new Promise((resolve, reject) => {
+      db.invites.findOne({ code: code.toUpperCase() },
+        (err, doc) => err ? reject(err) : resolve(doc)
+      );
+    }),
+
+    // Incrementa uso
+    use: (code) => new Promise((resolve, reject) => {
+      db.invites.update({ code }, { $inc: { uses: 1 } }, {},
+        (err) => err ? reject(err) : resolve()
+      );
+    })
+  }
 };
