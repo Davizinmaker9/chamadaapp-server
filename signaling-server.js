@@ -253,14 +253,28 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('send-dm', async ({ from, to, content, fromUsername, fromAvatar }) => {
+  socket.on('send-dm', async ({ from, to, content, fromUsername, fromAvatar, file }) => {
     try {
-      if (!content || !content.trim()) return;
-      const message = await messageDb.saveDirectMessage({ from, to, content: content.trim() });
+      // Rejeita se não tem conteúdo nem arquivo
+      if ((!content || !content.trim()) && !file) return;
+
+      // Valida tamanho do arquivo (máx 8MB em base64)
+      if (file && file.data && file.data.length > 11_000_000) {
+        return socket.emit('error-msg', { message: 'Arquivo muito grande. Máximo 8MB.' });
+      }
+
+      const message = await messageDb.saveDirectMessage({
+        from, to,
+        content: content?.trim() || '',
+        file: file || null   // { name, size, type, data } em base64
+      });
+
       socket.emit('dm-sent', { message, toUserId: to });
       const recipient = onlineUsers.get(to);
       if (recipient) {
-        io.to(recipient.socketId).emit('new-dm', { ...message, fromUsername, fromAvatar: fromAvatar || '😊' });
+        io.to(recipient.socketId).emit('new-dm', {
+          ...message, fromUsername, fromAvatar: fromAvatar || '😊'
+        });
       }
     } catch (err) {
       bugReporter.reportBug('SEND_DM_ERROR', err, { from, to });

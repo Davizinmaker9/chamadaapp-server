@@ -249,11 +249,12 @@ const messageDb = {
     return new Promise((resolve, reject) => {
       const message = {
         messageId: uuidv4(),
-        from: messageData.from,
-        to: messageData.to,
-        content: messageData.content,
+        from:      messageData.from,
+        to:        messageData.to,
+        content:   messageData.content || '',
+        file:      messageData.file || null,   // { name, size, type, data } base64
         timestamp: Date.now(),
-        read: false
+        read:      false
       };
 
       db.directMessages.insert(message, (err, newMessage) => {
