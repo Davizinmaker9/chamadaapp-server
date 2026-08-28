@@ -8,8 +8,9 @@ const { userDb, groupDb, messageDb, friendDb, inviteDb } = require('./database')
 
 // BugReporter opcional — funciona local, ignora erros na nuvem
 let bugReporter = { reportInfo: () => {}, reportBug: () => {}, reportWarning: () => {}, getSummary: () => {} };
+let BugReporter = null;
 try {
-  const BugReporter = require('./bug-reporter');
+  BugReporter = require('./bug-reporter');
   bugReporter = new BugReporter();
 } catch (_) {}
 
@@ -48,6 +49,7 @@ async function broadcastOnlineUsers() {
 app.get('/health', (_req, res) => res.json({ status: 'ok', onlineUsers: onlineUsers.size }));
 
 app.get('/bugs/latest', (_req, res) => {
+  if (!BugReporter) return res.json({ message: 'Sistema de relatório de bugs indisponível' });
   const latest = BugReporter.getLatestReport();
   latest
     ? res.type('text/plain').send(latest.content)
@@ -55,6 +57,7 @@ app.get('/bugs/latest', (_req, res) => {
 });
 
 app.get('/bugs', (_req, res) => {
+  if (!BugReporter) return res.json({ total: 0, reports: [] });
   const reports = BugReporter.listReports();
   res.json({ total: reports.length, reports });
 });
@@ -91,7 +94,8 @@ io.on('connection', (socket) => {
       const user = await userDb.findUser({ username });
       if (!user) return socket.emit('login-error', { message: 'Usuário não encontrado' });
 
-      if (user.password && password) {
+      if (user.password) {
+        if (!password) return socket.emit('login-error', { message: 'Senha obrigatória' });
         const ok = await userDb.verifyPassword(user.userId, password);
         if (!ok) return socket.emit('login-error', { message: 'Senha incorreta' });
       }
